@@ -1,0 +1,69 @@
+; Import-linter contract. ARCHITECTURE.md §4.1, TEST-502.
+;
+; routers -> services -> retrieval -> (db, providers, ingestion, storage) -> (schemas,
+; observability). No upward imports. schemas imports nothing from db, services, or providers
+; (enforced by being a bottom layer). Only providers/* may import the OpenAI SDK.
+;
+; `retrieval` sits between `services` and `db` (not alongside db/providers/ingestion/storage
+; as a peer) because it's pure algorithm + SQL built on the ORM models — it depends on `db`,
+; which none of db/providers/ingestion/storage do on each other.
+;
+; `observability` (T-5.9) is a second bottom layer, a peer of `schemas`: it wraps
+; prometheus_client only, depends on nothing else in `app`, and every layer above it — api,
+; services, retrieval, db/providers/ingestion/storage — needs to record a metric.
+;
+; `rag` (T-6.3) sits between `services` and `retrieval`: context assembly reads
+; `app.retrieval.fusion.RankedCandidate` (the ranked, post-gate candidate list) and the ORM
+; models directly, so it needs `retrieval` and `db` below it, while `answer_service` (in
+; `services`) needs to call it from above.
+;
+; `llm` (T-6.4) is its own layer between db/providers/ingestion/storage and schemas:
+; `providers.openai_llm_client` needs to read `llm.prompts.SYSTEM_PROMPT`, so `llm` can't be a
+; peer of `providers` (peers can't import each other); and `llm` imports `app.config`, which
+; itself imports `app.schemas.base` for a shared constant, so `llm` can't be a peer of
+; `schemas` either (a layers contract treats that transitive reach the same as a direct one).
+; A dedicated layer in between satisfies both.
+;
+; `cli` (T-8.1) sits ABOVE `api`/`worker`, not beside them: `export-openapi` imports
+; `app.main` (deferred, inside the function, but import-linter's static analysis still sees
+; it) to introspect the fully-wired app, including its routers — so `cli` depends on `api`,
+; which rules out peer status (peers may not import each other).
+
+[importlinter]
+root_package = app
+include_external_packages = True
+
+[importlinter:contract:layers]
+name = Layered architecture (ARCHITECTURE.md §4.1)
+type = layers
+layers =
+    app.cli
+    app.api | app.worker
+    app.services
+    app.rag
+    app.retrieval
+    app.db | app.providers | app.ingestion | app.storage
+    app.llm
+    app.schemas | app.observability
+
+[importlinter:contract:openai-boundary]
+name = Only providers/* may import the OpenAI SDK
+type = forbidden
+; allow_indirect_imports: T-5.7 needs app.api/app.services to call
+; app.providers.factory.get_embedding_client() (constructing the real client behind the
+; EmbeddingClient Protocol for actual request handling, same as the pre-existing
+; app.storage.factory.get_storage() call from app.api.routers.documents) — that path never
+; touches an `openai` symbol directly, it only sees the Protocol-typed return value. Without
+; this flag the contract also flags that indirect chain, which would make it impossible for
+; any real code path to ever wire the real provider in. Direct `import openai` outside
+; providers/* is still forbidden; only the transitive check is relaxed.
+allow_indirect_imports = True
+source_modules =
+    app.api
+    app.worker
+    app.services
+    app.db
+    app.ingestion
+    app.schemas
+forbidden_modules =
+    openai
